@@ -70,6 +70,8 @@ class SensorNode(wsn.Node):
         self.child_networks_table = {}
         self.members_table = []
         self.received_JR_guis = []  # keeps received Join Request global unique ids
+        self.packet_delays = []  # Track delays for packets reaching this node
+        self.packet_paths = []  # Track paths of packets reaching this node
 
     ###################
     def run(self):
@@ -155,7 +157,9 @@ class SensorNode(wsn.Node):
         min_hop = 99999
         min_hop_gui = 99999
         for gui in self.candidate_parents_table:
-            if gui in self.neighbors_table:
+            if (
+                gui in self.neighbors_table
+            ):
                 if self.neighbors_table[gui]["hop_count"] < min_hop or (
                     self.neighbors_table[gui]["hop_count"] == min_hop
                     and gui < min_hop_gui
@@ -163,7 +167,9 @@ class SensorNode(wsn.Node):
                     min_hop = self.neighbors_table[gui]["hop_count"]
                     min_hop_gui = gui
 
-        if min_hop_gui != 99999 and min_hop_gui in self.neighbors_table:
+        if (
+            min_hop_gui != 99999 and min_hop_gui in self.neighbors_table
+        ):
             selected_addr = self.neighbors_table[min_hop_gui]["source"]
             self.send_join_request(selected_addr)
             self.set_timer("TIMER_JOIN_REQUEST", 5)
@@ -251,6 +257,101 @@ class SensorNode(wsn.Node):
         )
 
     ###################
+    def send_neighbor_table_update(self):
+        """Share neighbor table with direct neighbors (for multi-hop discovery)"""
+        neighbor_data = {
+            gui: {
+                "hop_count": info["hop_count"],
+                "addr": info.get("addr"),
+                "ch_addr": info.get("ch_addr"),
+                "distance": info.get("distance", 999),
+            }
+            for gui, info in self.neighbors_table.items()
+        }
+        self.send(
+            {
+                "dest": wsn.BROADCAST_ADDR,
+                "type": "NEIGHBOR_TABLE_UPDATE",
+                "gui": self.id,
+                "source": self.addr,
+                "neighbors": neighbor_data,
+            }
+        )
+
+    ###################
+    def find_node_by_addr(self, addr):
+        """Find node GUI by its address in neighbor table
+
+        Args:
+            addr (Addr): Address to search for
+        Returns:
+            int or None: GUI of node with that address, or None if not found
+        """
+        for gui, info in self.neighbors_table.items():
+            if info.get("addr") == addr:
+                return gui
+        return None
+
+    ###################
+    def route_packet_mesh_first(self, pck):
+        """Try mesh routing first (local neighborhood), fall back to tree routing
+
+        Args:
+            pck (Dict): Packet to route
+        Returns:
+            Addr or None: Next hop address, or None if no route found
+        """
+        # Add to path for tracing
+        if "path" not in pck:
+            pck["path"] = []
+        pck["path"].append(self.id)
+
+        # Find destination node GUI
+        dest_gui = self.find_node_by_addr(pck["dest"])
+
+        # 1-Hop MESH ROUTING: Is destination in my 1-hop neighborhood?
+        if dest_gui is not None and dest_gui in self.neighbors_table:
+            return pck["dest"]  # Direct delivery
+
+        # 2-Hop MESH ROUTING: Is destination in my 2-hop neighborhood?
+        for gui, info in self.neighbors_table.items():
+            if dest_gui in info.get("neighbors", {}):
+                # Destination is neighbor of my neighbor, route through that neighbor
+                return info["addr"]
+
+        # TREE ROUTING: If not, fall back to tree-based routing
+        return self.tree_route(pck)
+
+    ###################
+    def tree_route(self, pck):
+        """Tree-based routing (existing logic)
+
+        Args:
+            pck (Dict): Packet to route
+        Returns:
+            Addr or None: Next hop address for tree routing
+        """
+        next_hop = None
+
+        # If not root, default route is toward parent
+        if self.role != Roles.ROOT:
+            if self.parent_gui in self.neighbors_table:
+                next_hop = self.neighbors_table[self.parent_gui]["ch_addr"]
+
+        # If I'm a cluster head, check if destination is in my childNetTable
+        if self.ch_addr is not None:
+            if pck["dest"].net_addr == self.ch_addr.net_addr:
+                next_hop = pck["dest"]
+            else:
+                for child_gui, child_networks in self.child_networks_table.items():
+                    if pck["dest"].net_addr in child_networks:
+                        if child_gui in self.neighbors_table:
+                            next_hop = self.neighbors_table[child_gui]["addr"]
+                            break
+
+        return next_hop
+
+    ###################
     def route_and_forward_package(self, pck):
         """Routing and forwarding given package
 
@@ -259,18 +360,11 @@ class SensorNode(wsn.Node):
         Returns:
 
         """
-        if self.role != Roles.ROOT:
-            if self.parent_gui in self.neighbors_table:
-                pck["next_hop"] = self.neighbors_table[self.parent_gui]["ch_addr"]
-        if self.ch_addr is not None:
-            if pck["dest"].net_addr == self.ch_addr.net_addr:
-                pck["next_hop"] = pck["dest"]
-            else:
-                for child_gui, child_networks in self.child_networks_table.items():
-                    if pck["dest"].net_addr in child_networks:
-                        if child_gui in self.neighbors_table:
-                            pck["next_hop"] = self.neighbors_table[child_gui]["addr"]
-                            break
+
+        next_hop = self.route_packet_mesh_first(pck)
+
+        if next_hop is not None:
+            pck["next_hop"] = next_hop
 
         self.send(pck)
 
@@ -284,9 +378,14 @@ class SensorNode(wsn.Node):
 
         """
         if self.root_addr is not None:
-            self.route_and_forward_package(
-                {"dest": self.root_addr, "type": "NETWORK_REQUEST", "source": self.addr}
-            )
+            pck = {
+                "dest": self.root_addr,
+                "type": "NETWORK_REQUEST",
+                "source": self.addr,
+                "timestamp": self.now,
+                "path": [self.id],
+            }
+            self.route_and_forward_package(pck)
 
     ###################
     def send_network_reply(self, dest, addr):
@@ -299,9 +398,15 @@ class SensorNode(wsn.Node):
         Returns:
 
         """
-        self.route_and_forward_package(
-            {"dest": dest, "type": "NETWORK_REPLY", "source": self.addr, "addr": addr}
-        )
+        pck = {
+            "dest": dest,
+            "type": "NETWORK_REPLY",
+            "source": self.addr,
+            "addr": addr,
+            "timestamp": self.now,
+            "path": [self.id],
+        }
+        self.route_and_forward_package(pck)
 
     ###################
     def send_network_update(self):
@@ -328,6 +433,37 @@ class SensorNode(wsn.Node):
             )
 
     ###################
+    def log_packet_metrics(self, pck):
+        """Log metrics for packets that reached their destination (STEP 3)
+
+        Args:
+            pck (Dict): Received packet with timestamp and path
+        """
+        if "timestamp" in pck:
+            delay = self.now - pck["timestamp"]
+            self.packet_delays.append(
+                {
+                    "delay": delay,
+                    "source": pck.get("source"),
+                    "type": pck["type"],
+                    "time": self.now,
+                }
+            )
+            self.log(f"Packet delay: {delay:.2f} from {pck.get('source')}")
+
+        if "path" in pck:
+            self.packet_paths.append(
+                {
+                    "path": pck["path"],
+                    "source": pck.get("source"),
+                    "dest": pck.get("dest"),
+                    "type": pck["type"],
+                    "time": self.now,
+                }
+            )
+            self.log(f"Packet path: {' -> '.join(map(str, pck['path']))}")
+
+    ###################
     def on_receive(self, pck):
         """Executes when a package received.
 
@@ -349,6 +485,12 @@ class SensorNode(wsn.Node):
                 return
             if pck["type"] == "HEART_BEAT":
                 self.update_neighbor(pck)
+            if pck["type"] == "NEIGHBOR_TABLE_UPDATE":
+                # Update my knowledge of 2-hop neighbors
+                sender_gui = pck["gui"]
+                if sender_gui in self.neighbors_table:
+                    # Store the sender's neighbors in my neighbor entry
+                    self.neighbors_table[sender_gui]["neighbors"] = pck["neighbors"]
             if (
                 pck["type"] == "PROBE"
             ):  # it waits and sends heart beat message once received probe message
@@ -362,6 +504,8 @@ class SensorNode(wsn.Node):
                 pck["type"] == "NETWORK_REQUEST"
             ):  # it sends a network reply to requested node
                 if self.role == Roles.ROOT:
+                    # Log metrics when packet reaches destination
+                    self.log_packet_metrics(pck)
                     new_addr = wsn.Addr(pck["source"].node_addr, 254)
                     self.send_network_reply(pck["source"], new_addr)
             if pck["type"] == "JOIN_ACK":
@@ -371,7 +515,9 @@ class SensorNode(wsn.Node):
                 if self.role != Roles.ROOT:
                     self.send_network_update()
             if pck["type"] == "SENSOR":
-                pass
+                # Log metrics when sensor data reaches root
+                if self.role == Roles.ROOT:
+                    self.log_packet_metrics(pck)
                 # self.log(str(pck['source'])+'--'+str(pck['sensor_value']))
 
         elif self.role == Roles.REGISTERED:  # if the node is registered
@@ -384,6 +530,8 @@ class SensorNode(wsn.Node):
                 self.send_network_request()
             # it becomes cluster head and send join reply to the candidates
             if pck["type"] == "NETWORK_REPLY":
+                # Log metrics when packet reaches destination
+                self.log_packet_metrics(pck)
                 self.set_role(Roles.CLUSTER_HEAD)
                 try:
                     write_clusterhead_distances_csv("clusterhead_distances.csv")
@@ -469,6 +617,8 @@ class SensorNode(wsn.Node):
             name == "TIMER_HEART_BEAT"
         ):  # it sends heart beat message once heart beat timer fired
             self.send_heart_beat()
+            if self.role in [Roles.REGISTERED, Roles.CLUSTER_HEAD, Roles.ROOT]:
+                self.send_neighbor_table_update()
             self.set_timer("TIMER_HEART_BEAT", config.HEARTH_BEAT_TIME_INTERVAL)
 
         # if it has not received heart beat messages before, it sets timer again and wait heart beat messages once join request timer fired.
@@ -480,21 +630,21 @@ class SensorNode(wsn.Node):
 
         elif name == "TIMER_SENSOR":
             if self.root_addr is not None:
-                self.route_and_forward_package(
-                    {
-                        "dest": self.root_addr,
-                        "type": "SENSOR",
-                        "source": self.addr,
-                        "sensor_value": random.uniform(10, 50),
-                    }
-                )
+                pck = {
+                    "dest": self.root_addr,
+                    "type": "SENSOR",
+                    "source": self.addr,
+                    "sensor_value": random.uniform(10, 50),
+                    "timestamp": self.now,
+                    "path": [self.id],
+                }
+                self.route_and_forward_package(pck)
             timer_duration = self.id % 20
             if timer_duration == 0:
                 timer_duration = 1
             self.set_timer("TIMER_SENSOR", timer_duration)
 
         elif name == "TIMER_EXPORT_CH_CSV":
-            # Only root should drive exports
             if self.role == Roles.ROOT:
                 try:
                     write_clusterhead_distances_csv("clusterhead_distances.csv")
@@ -512,28 +662,6 @@ class SensorNode(wsn.Node):
                 self.set_timer(
                     "TIMER_EXPORT_NEIGHBOR_CSV", config.EXPORT_NEIGHBOR_CSV_INTERVAL
                 )
-
-    # User Defined methods
-    ###################
-
-    def send_neighbor_table_update(self):
-        """Share neighbor table with direct neighbors"""
-        neighbor_data = {
-            gui: {
-                "hop_count": info["hop_count"],
-                "addr": info["addr"],
-                "distance": info.get("distance", 999),
-            }
-            for gui, info in self.neighbors_table.items()
-        }
-        self.send(
-            {
-                "dest": wsn.BROADCAST_ADDR,
-                "type": "NEIGHBOR_TABLE_UPDATE",
-                "gui": self.id,
-                "neighbors": neighbor_data,
-            }
-        )
 
 
 ROOT_ID = random.randrange(config.SIM_NODE_COUNT)  # 0..count-1
@@ -665,6 +793,51 @@ def write_neighbor_distances_csv(path="neighbor_distances.csv", dedupe_undirecte
                 w.writerow([node.id, n_gui, f"{dist:.6f}", n_role, hop, at])
 
 
+def write_packet_metrics_csv(path="packet_metrics.csv"):
+    """Write packet delay and path metrics (STEP 3)"""
+    with open(path, "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["node_id", "packet_type", "source", "delay", "time"])
+
+        for node in sim.nodes:
+            if hasattr(node, "packet_delays"):
+                for metric in node.packet_delays:
+                    w.writerow(
+                        [
+                            node.id,
+                            metric.get("type", ""),
+                            metric.get("source", ""),
+                            f"{metric.get('delay', 0):.6f}",
+                            f"{metric.get('time', 0):.2f}",
+                        ]
+                    )
+
+
+def write_packet_paths_csv(path="packet_paths.csv"):
+    """Write packet path traces (STEP 3)"""
+    with open(path, "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(
+            ["node_id", "packet_type", "source", "dest", "path", "hop_count", "time"]
+        )
+
+        for node in sim.nodes:
+            if hasattr(node, "packet_paths"):
+                for metric in node.packet_paths:
+                    path_str = " -> ".join(map(str, metric.get("path", [])))
+                    w.writerow(
+                        [
+                            node.id,
+                            metric.get("type", ""),
+                            metric.get("source", ""),
+                            metric.get("dest", ""),
+                            path_str,
+                            len(metric.get("path", [])) - 1,  # hop count
+                            f"{metric.get('time', 0):.2f}",
+                        ]
+                    )
+
+
 ###########################################################
 def create_network(node_class, number_of_nodes=100):
     """Creates given number of nodes at random positions with random arrival times.
@@ -677,7 +850,7 @@ def create_network(node_class, number_of_nodes=100):
     """
     edge = math.ceil(math.sqrt(number_of_nodes))
     for i in range(number_of_nodes):
-        x = i // edge
+        x = i / edge
         y = i % edge
         px = (
             300
@@ -721,3 +894,6 @@ write_node_distance_matrix_csv("node_distance_matrix.csv")
 # start the simulation
 sim.run()
 print("Simulation Finished")
+
+write_packet_metrics_csv("packet_metrics.csv")
+write_packet_paths_csv("packet_paths.csv")
