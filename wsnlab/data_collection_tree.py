@@ -13,21 +13,27 @@ sys.path.insert(1, ".")
 NODE_POS = {}  # {node_id: (x, y)}
 
 # --- tracking containers ---
-ALL_NODES = []  # node objects
-CLUSTER_HEADS = []
 ROLE_COUNTS = Counter()  # live tally per Roles enum
-
-
-def _addr_str(a):
-    return "" if a is None else str(a)
-
-
-def _role_name(r):
-    return r.name if hasattr(r, "name") else str(r)
-
 
 Roles = Enum("Roles", "UNDISCOVERED UNREGISTERED ROOT REGISTERED CLUSTER_HEAD")
 """Enumeration of roles"""
+
+###########################################################
+
+
+class GUIAddr:
+    def __init__(self, networkID, hostID):
+        self.networkID = networkID
+        self.hostID = hostID
+
+    def __repr__(self):
+        return f"{self.networkID}.{self.hostID}"
+
+    def __eq__(self, other):
+        if not isinstance(other, GUIAddr):
+            return False
+        return self.networkID == other.networkID and self.hostID == other.hostID
+
 
 ###########################################################
 
@@ -60,6 +66,17 @@ class SensorNode(wsn.Node):
         self.ch_addr = None
         self.parent_gui = None
         self.root_addr = None
+
+        # New attributes
+        self.gui_addr = None
+        self.root_id = None
+        self.is_dead = False
+        self.start_time = self.now
+
+        # Sequential Addressing State
+        self.next_gui_index = 1  # Start children at .1 (Self is .0)
+        self.next_network_index = 1  # Start network IDs at 1 (Root is 0)
+
         self.set_role(Roles.UNDISCOVERED)
         self.is_root_eligible = True if self.id == ROOT_ID else False
         self.c_probe = 0  # c means counter and probe is the name of counter
@@ -72,6 +89,16 @@ class SensorNode(wsn.Node):
         self.received_JR_guis = []  # keeps received Join Request global unique ids
         self.packet_delays = []  # Track delays for packets reaching this node
         self.packet_paths = []  # Track paths of packets reaching this node
+
+    ###################
+    def die(self):
+        """Simulates node death"""
+        self.is_dead = True
+        self.kill_all_timers()
+        self.set_role(Roles.UNDISCOVERED, recolor=False)
+        self.scene.nodecolor(self.id, 0, 0, 0)  # Black
+        self.set_label("X")
+        self.log(f"Node {self.id} has died")
 
     ###################
     def run(self):
@@ -113,16 +140,73 @@ class SensorNode(wsn.Node):
                 )
 
     ###################
+    def become_root(self):
+        self.set_role(Roles.ROOT)
+        self.addr = wsn.Addr(self.id, 254)
+        self.gui_addr = GUIAddr(0, 0)  # Root is 0.0
+        self.set_label(str(self.gui_addr))
+
+        self.next_gui_index = 1  # Reset child counter
+        self.next_network_index = 1  # Reset network counter
+
+        self.ch_addr = self.addr
+        self.root_addr = self.addr
+        self.root_id = self.id
+        self.hop_count = 0
+        self.set_timer("TIMER_HEART_BEAT", config.HEARTH_BEAT_TIME_INTERVAL)
+
+    def become_cluster_head(self, net_id, assigned_net_index=None):
+        self.set_role(Roles.CLUSTER_HEAD)
+        self.addr = wsn.Addr(net_id, 254)
+
+        # CH is the .254 of its subnet
+        # Use assigned visual network ID if available, otherwise fallback to physical ID
+        visual_net = assigned_net_index if assigned_net_index is not None else net_id
+        self.gui_addr = GUIAddr(visual_net, 254)
+        self.set_label(str(self.gui_addr))
+
+        self.next_gui_index = 1  # Reset child counter
+
+        self.ch_addr = self.addr
+        self.scene.nodecolor(self.id, 0, 0, 1)
+        self.send_network_update()
+        self.send_heart_beat()
+
+        try:
+            write_clusterhead_distances_csv("clusterhead_distances.csv")
+        except Exception as e:
+            self.log(f"CH CSV export error: {e}")
+
+    def become_registered(
+        self, parent_addr, assigned_gui_index=None, visual_net_id=None
+    ):
+        self.set_role(Roles.REGISTERED)
+        # Protocol: Addr based on ID
+        self.addr = wsn.Addr(parent_addr.net_addr, self.id)
+
+        networkID = visual_net_id if visual_net_id is not None else parent_addr.net_addr
+        hostID = assigned_gui_index if assigned_gui_index is not None else self.id
+
+        self.gui_addr = GUIAddr(networkID, hostID)
+        self.set_label(str(self.gui_addr))
+
+        self.log(f"Registered: Protocol={self.addr}, Visual={self.gui_addr}")
+
+        self.set_timer("TIMER_HEART_BEAT", config.HEARTH_BEAT_TIME_INTERVAL)
+
+    ###################
     def become_unregistered(self):
         if self.role != Roles.UNDISCOVERED:
             self.kill_all_timers()
             self.log("I became UNREGISTERED")
         self.scene.nodecolor(self.id, 1, 1, 0)
+        self.set_label(str(self.id))
         self.erase_parent()
         self.addr = None
         self.ch_addr = None
         self.parent_gui = None
         self.root_addr = None
+        self.gui_addr = None
         self.set_role(Roles.UNREGISTERED)
         self.c_probe = 0
         self.th_probe = 10
@@ -157,9 +241,7 @@ class SensorNode(wsn.Node):
         min_hop = 99999
         min_hop_gui = 99999
         for gui in self.candidate_parents_table:
-            if (
-                gui in self.neighbors_table
-            ):
+            if gui in self.neighbors_table:
                 if self.neighbors_table[gui]["hop_count"] < min_hop or (
                     self.neighbors_table[gui]["hop_count"] == min_hop
                     and gui < min_hop_gui
@@ -167,9 +249,7 @@ class SensorNode(wsn.Node):
                     min_hop = self.neighbors_table[gui]["hop_count"]
                     min_hop_gui = gui
 
-        if (
-            min_hop_gui != 99999 and min_hop_gui in self.neighbors_table
-        ):
+        if min_hop_gui != 99999 and min_hop_gui in self.neighbors_table:
             selected_addr = self.neighbors_table[min_hop_gui]["source"]
             self.send_join_request(selected_addr)
             self.set_timer("TIMER_JOIN_REQUEST", 5)
@@ -219,7 +299,7 @@ class SensorNode(wsn.Node):
         self.send({"dest": dest, "type": "JOIN_REQUEST", "gui": self.id})
 
     ###################
-    def send_join_reply(self, gui, addr):
+    def send_join_reply(self, gui, addr, assigned_gui_index=None, visual_net_id=None):
         """Sending join reply message to register the node requested to join.
         The message includes a gui to determine which node will take this reply, an addr to be assigned to the node
         and a root_addr.
@@ -240,6 +320,8 @@ class SensorNode(wsn.Node):
                 "addr": addr,
                 "root_addr": self.root_addr,
                 "hop_count": self.hop_count + 1,
+                "gui_index": assigned_gui_index,
+                "visual_net_id": visual_net_id,
             }
         )
 
@@ -388,7 +470,7 @@ class SensorNode(wsn.Node):
             self.route_and_forward_package(pck)
 
     ###################
-    def send_network_reply(self, dest, addr):
+    def send_network_reply(self, dest, addr, assigned_net_index=None):
         """Sending network reply message to dest address to be cluster head with a new adress
 
         Args:
@@ -405,6 +487,7 @@ class SensorNode(wsn.Node):
             "addr": addr,
             "timestamp": self.now,
             "path": [self.id],
+            "net_index": assigned_net_index,
         }
         self.route_and_forward_package(pck)
 
@@ -434,7 +517,7 @@ class SensorNode(wsn.Node):
 
     ###################
     def log_packet_metrics(self, pck):
-        """Log metrics for packets that reached their destination (STEP 3)
+        """Log metrics for packets that reached their destination
 
         Args:
             pck (Dict): Received packet with timestamp and path
@@ -472,6 +555,9 @@ class SensorNode(wsn.Node):
         Returns:
 
         """
+        if self.is_dead:
+            return
+
         if (
             self.role == Roles.ROOT or self.role == Roles.CLUSTER_HEAD
         ):  # if the node is root or cluster head
@@ -497,8 +583,19 @@ class SensorNode(wsn.Node):
                 self.send_heart_beat()
             # it waits and sends join reply message once received join request
             if pck["type"] == "JOIN_REQUEST":
+                idx = self.next_gui_index
+                self.next_gui_index += 1
+
+                # Use Visual Network ID to propagate to child
+                visual_net = (
+                    self.gui_addr.networkID if self.gui_addr else self.addr.net_addr
+                )
+
                 self.send_join_reply(
-                    pck["gui"], wsn.Addr(self.ch_addr.net_addr, pck["gui"])
+                    pck["gui"],
+                    wsn.Addr(self.ch_addr.net_addr, pck["gui"]),
+                    assigned_gui_index=idx,
+                    visual_net_id=visual_net,
                 )
             if (
                 pck["type"] == "NETWORK_REQUEST"
@@ -507,7 +604,14 @@ class SensorNode(wsn.Node):
                     # Log metrics when packet reaches destination
                     self.log_packet_metrics(pck)
                     new_addr = wsn.Addr(pck["source"].node_addr, 254)
-                    self.send_network_reply(pck["source"], new_addr)
+
+                    # Allocate Visual Network ID
+                    net_idx = self.next_network_index
+                    self.next_network_index += 1
+
+                    self.send_network_reply(
+                        pck["source"], new_addr, assigned_net_index=net_idx
+                    )
             if pck["type"] == "JOIN_ACK":
                 self.members_table.append(pck["gui"])
             if pck["type"] == "NETWORK_UPDATE":
@@ -532,17 +636,26 @@ class SensorNode(wsn.Node):
             if pck["type"] == "NETWORK_REPLY":
                 # Log metrics when packet reaches destination
                 self.log_packet_metrics(pck)
-                self.set_role(Roles.CLUSTER_HEAD)
-                try:
-                    write_clusterhead_distances_csv("clusterhead_distances.csv")
-                except Exception as e:
-                    self.log(f"CH CSV export error: {e}")
-                self.scene.nodecolor(self.id, 0, 0, 1)
-                self.ch_addr = pck["addr"]
-                self.send_network_update()
-                self.send_heart_beat()
+
+                net_idx = pck.get("net_index")
+                self.become_cluster_head(
+                    pck["addr"].net_addr, assigned_net_index=net_idx
+                )
+
+                # Send Join Replies to all deferred nodes
                 for gui in self.received_JR_guis:
-                    self.send_join_reply(gui, wsn.Addr(self.ch_addr.net_addr, gui))
+                    idx = self.next_gui_index
+                    self.next_gui_index += 1
+
+                    # Use Visual Network ID
+                    visual_net = self.gui_addr.networkID
+
+                    self.send_join_reply(
+                        gui,
+                        wsn.Addr(self.ch_addr.net_addr, gui),
+                        assigned_gui_index=idx,
+                        visual_net_id=visual_net,
+                    )
 
         elif self.role == Roles.UNDISCOVERED:  # if the node is undiscovered
             # it kills probe timer, becomes unregistered and sets join request timer once received heart beat
@@ -557,14 +670,16 @@ class SensorNode(wsn.Node):
             # it becomes registered and sends join ack if the message is sent to itself once received join reply
             if pck["type"] == "JOIN_REPLY":
                 if pck["dest_gui"] == self.id:
-                    self.addr = pck["addr"]
                     self.parent_gui = pck["gui"]
                     self.root_addr = pck["root_addr"]
                     self.hop_count = pck["hop_count"]
+                    self.root_id = (
+                        pck["root_addr"].net_addr if pck["root_addr"] else None
+                    )
+
                     self.draw_parent()
                     self.kill_timer("TIMER_JOIN_REQUEST")
-                    self.send_heart_beat()
-                    self.set_timer("TIMER_HEART_BEAT", config.HEARTH_BEAT_TIME_INTERVAL)
+
                     self.send_join_ack(pck["source"])
                     if (
                         self.ch_addr is not None
@@ -572,7 +687,14 @@ class SensorNode(wsn.Node):
                         self.set_role(Roles.CLUSTER_HEAD)
                         self.send_network_update()
                     else:
-                        self.set_role(Roles.REGISTERED)
+                        # Pass the assigned index and network ID to registration
+                        idx = pck.get("gui_index")
+                        v_net = pck.get("visual_net_id")
+                        self.become_registered(
+                            pck["source"], assigned_gui_index=idx, visual_net_id=v_net
+                        )
+
+                    self.send_heart_beat()
 
     ###################
     def on_timer_fired(self, name, *args, **kwargs):
@@ -585,6 +707,9 @@ class SensorNode(wsn.Node):
         Returns:
 
         """
+        if self.is_dead:
+            return
+
         if (
             name == "TIMER_ARRIVAL"
         ):  # it wakes up and set timer probe once time arrival timer fired
@@ -602,13 +727,7 @@ class SensorNode(wsn.Node):
                 if (
                     self.is_root_eligible
                 ):  # if the node is root eligible, it becomes root
-                    self.set_role(Roles.ROOT)
-                    self.scene.nodecolor(self.id, 0, 0, 0)
-                    self.addr = wsn.Addr(self.id, 254)
-                    self.ch_addr = wsn.Addr(self.id, 254)
-                    self.root_addr = self.addr
-                    self.hop_count = 0
-                    self.set_timer("TIMER_HEART_BEAT", config.HEARTH_BEAT_TIME_INTERVAL)
+                    self.become_root()
                 else:  # otherwise it keeps trying to sending probe after a long time
                     self.c_probe = 0
                     self.set_timer("TIMER_PROBE", 30)
@@ -664,7 +783,8 @@ class SensorNode(wsn.Node):
                 )
 
 
-ROOT_ID = random.randrange(config.SIM_NODE_COUNT)  # 0..count-1
+ROOT_ID = 0  # ROOT IS ALWAYS NODE 0
+ROOT_POS_INDEX = random.randrange(config.SIM_NODE_COUNT)  # RANDOM POSITION FOR ROOT
 
 
 def write_node_distances_csv(path="node_distances.csv"):
@@ -709,19 +829,14 @@ def write_clusterhead_distances_csv(path="clusterhead_distances.csv"):
             x, y = NODE_POS[node.id]
             clusterheads.append((node.id, x, y))
 
-    if len(clusterheads) < 2:
-        # Still write the header so the file exists/is refreshed
-        with open(path, "w", newline="") as f:
-            csv.writer(f).writerow(["clusterhead_1", "clusterhead_2", "distance"])
-        return
-
     with open(path, "w", newline="") as f:
         w = csv.writer(f)
         w.writerow(["clusterhead_1", "clusterhead_2", "distance"])
-        for i, (id1, x1, y1) in enumerate(clusterheads):
-            for id2, x2, y2 in clusterheads[i + 1 :]:
-                dist = math.hypot(x1 - x2, y1 - y2)
-                w.writerow([id1, id2, f"{dist:.6f}"])
+        if len(clusterheads) >= 2:
+            for i, (id1, x1, y1) in enumerate(clusterheads):
+                for id2, x2, y2 in clusterheads[i + 1 :]:
+                    dist = math.hypot(x1 - x2, y1 - y2)
+                    w.writerow([id1, id2, f"{dist:.6f}"])
 
 
 def write_neighbor_distances_csv(path="neighbor_distances.csv", dedupe_undirected=True):
@@ -794,7 +909,7 @@ def write_neighbor_distances_csv(path="neighbor_distances.csv", dedupe_undirecte
 
 
 def write_packet_metrics_csv(path="packet_metrics.csv"):
-    """Write packet delay and path metrics (STEP 3)"""
+    """Write packet delay and path metrics """
     with open(path, "w", newline="") as f:
         w = csv.writer(f)
         w.writerow(["node_id", "packet_type", "source", "delay", "time"])
@@ -814,7 +929,7 @@ def write_packet_metrics_csv(path="packet_metrics.csv"):
 
 
 def write_packet_paths_csv(path="packet_paths.csv"):
-    """Write packet path traces (STEP 3)"""
+    """Write packet path traces """
     with open(path, "w", newline="") as f:
         w = csv.writer(f)
         w.writerow(
@@ -850,8 +965,16 @@ def create_network(node_class, number_of_nodes=100):
     """
     edge = math.ceil(math.sqrt(number_of_nodes))
     for i in range(number_of_nodes):
-        x = i / edge
-        y = i % edge
+        # Determine which grid slot this node belongs to
+        pos_index = i
+        if i == 0:
+            pos_index = ROOT_POS_INDEX
+            print(f"PLACING ROOT (Node 0) at Grid Index {pos_index}")
+        elif i == ROOT_POS_INDEX:
+            pos_index = 0
+
+        x = pos_index // edge
+        y = pos_index % edge
         px = (
             300
             + config.SCALE * x * config.SIM_NODE_PLACING_CELL_SIZE
