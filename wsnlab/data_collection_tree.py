@@ -2498,61 +2498,6 @@ def write_failure_events_csv(path="failure_events.csv"):
             )
 
 
-def write_failure_impact_csv(path="failure_impact.csv"):
-    """Export aggregated impact per failure event."""
-    with open(path, "w", newline="") as f:
-        w = csv.writer(f)
-        w.writerow(
-            [
-                "failure_id",
-                "failed_node",
-                "time_occurred",
-                "num_orphans",
-                "avg_recovery_time",
-                "max_recovery_time",
-            ]
-        )
-
-        failure_map = {}
-        for event in FAILURE_EVENTS:
-            fid = event["failure_id"]
-            if fid not in failure_map:
-                failure_map[fid] = {
-                    "failed_node": None,
-                    "time": None,
-                    "orphans": 0,
-                    "recoveries": [],
-                }
-
-            if event["event_type"] == "NODE_DIED":
-                failure_map[fid]["failed_node"] = event["node_id"]
-                failure_map[fid]["time"] = event["time"]
-            elif event["event_type"] == "NODE_RECOVERED":
-                failure_map[fid]["orphans"] += 1
-                if "recovery_duration" in event:
-                    failure_map[fid]["recoveries"].append(event["recovery_duration"])
-
-        for fid, data in failure_map.items():
-            avg_recovery = ""
-            max_recovery = ""
-            if data["recoveries"]:
-                avg_recovery = (
-                    f"{sum(data['recoveries']) / len(data['recoveries']):.2f}"
-                )
-                max_recovery = f"{max(data['recoveries']):.2f}"
-
-            w.writerow(
-                [
-                    fid,
-                    data["failed_node"],
-                    f"{data['time']:.2f}" if data["time"] else "",
-                    data["orphans"],
-                    avg_recovery,
-                    max_recovery,
-                ]
-            )
-
-
 ###########################################################
 def create_network(node_class, number_of_nodes=100):
     """Creates given number of nodes at random positions with random arrival times."""
@@ -2636,4 +2581,3 @@ write_packet_loss_csv("packet_loss.csv")
 
 # failure logging
 write_failure_events_csv("failure_events.csv")
-write_failure_impact_csv("failure_impact.csv")
