@@ -9,19 +9,54 @@ import sys
 
 sys.path.insert(1, ".")
 
-# Track where each node is placed for CSV exports and distance calculations
-NODE_POS = {}  # {node_id: (x, y)}
+class SimulationContext:
+    """Centralized simulation state"""
+    def __init__(self):
+        self.node_positions = {}
+        self.orphan_count = 0
+        self.orphan_history = []
+        self.failure_events = []
+        self.current_failure_id = 0
+        self.role_counts = Counter()
+    
+    def increment_orphan_count(self, time):
+        self.orphan_count += 1
+        self.orphan_history.append((time, self.orphan_count))
+    
+    def decrement_orphan_count(self, time):
+        self.orphan_count = max(0, self.orphan_count - 1)
+        self.orphan_history.append((time, self.orphan_count))
+    
+    def register_failure(self, time, node_id, role_at_death):
+        self.current_failure_id += 1
+        self.failure_events.append({
+            'failure_id': self.current_failure_id,
+            'time': time,
+            'node_id': node_id,
+            'event_type': 'NODE_DIED',
+            'role_at_death': role_at_death,
+        })
+        return self.current_failure_id
+    
+    def register_recovery(self, failure_id, time, node_id, new_role, recovery_duration):
+        self.failure_events.append({
+            'failure_id': failure_id,
+            'time': time,
+            'node_id': node_id,
+            'event_type': 'NODE_RECOVERED',
+            'new_role': new_role,
+            'recovery_duration': recovery_duration,
+        })
+
+SIMULATION_CONTEXT = None  # Global instance placeholder
 
 # --- tracking containers ---
-ROLE_COUNTS = Counter()
+# ROLE_COUNTS moved to SimulationContext
 
 Roles = Enum("Roles", "UNDISCOVERED UNREGISTERED ROOT REGISTERED CLUSTER_HEAD ROUTER")
 
 # --- GLOBAL METRICS ---
-ORPHAN_COUNT = 0
-ORPHAN_HISTORY = []
-FAILURE_EVENTS = []
-CURRENT_FAILURE_ID = 0
+# ORPHAN_COUNT, ORPHAN_HISTORY, FAILURE_EVENTS, CURRENT_FAILURE_ID moved to SimulationContext
 
 PACKET_LOSS_RATIO = getattr(config, "PACKET_LOSS_RATIO", 0.0)
 TRANSMISSION_DELAY_PER_BYTE = config.TRANSMISSION_DELAY_PER_BYTE  # 0.1 ms per byte
@@ -57,6 +92,11 @@ class SensorNode(wsn.Node):
     ###################
     def init(self):
         """Initialization of node."""
+        global SIMULATION_CONTEXT
+        if SIMULATION_CONTEXT is None:
+            SIMULATION_CONTEXT = SimulationContext()
+        self.sim_context = SIMULATION_CONTEXT
+
         self.scene.nodecolor(self.id, 1, 1, 1)  # sets self color to white
         self.sleep()
         self.addr = None
@@ -258,22 +298,8 @@ class SensorNode(wsn.Node):
         self.is_dead = True
         self.kill_all_timers()
 
-        # Global Failure Tracking
-        global FAILURE_EVENTS, CURRENT_FAILURE_ID, ORPHAN_COUNT
-
-        CURRENT_FAILURE_ID += 1
-        failure_id = CURRENT_FAILURE_ID
-
-        FAILURE_EVENTS.append(
-            {
-                "failure_id": failure_id,
-                "time": self.now,
-                "node_id": self.id,
-                "event_type": "NODE_DIED",
-                "role_at_death": self.role.name,
-            }
-        )
-
+        # Global Failure Tracking via Context
+        failure_id = self.sim_context.register_failure(self.now, self.id, self.role.name)
         self.current_failure_id = failure_id  # Track which failure affected this node
 
         # Trigger cascading failures to children
@@ -289,8 +315,8 @@ class SensorNode(wsn.Node):
 
             # Decrement orphan count if it was one
             if self.role == Roles.UNREGISTERED:
-                ORPHAN_COUNT = max(0, ORPHAN_COUNT - 1)
-                ORPHAN_HISTORY.append((self.now, ORPHAN_COUNT))
+                self.sim_context.decrement_orphan_count(self.now)
+                
         self.erase_parent()
 
         self.set_role(Roles.UNDISCOVERED, recolor=False)
@@ -328,10 +354,10 @@ class SensorNode(wsn.Node):
             )
 
         if old_role is not None:
-            ROLE_COUNTS[old_role] -= 1
-            if ROLE_COUNTS[old_role] <= 0:
-                ROLE_COUNTS.pop(old_role, None)
-        ROLE_COUNTS[new_role] += 1
+            self.sim_context.role_counts[old_role] -= 1
+            if self.sim_context.role_counts[old_role] <= 0:
+                self.sim_context.role_counts.pop(old_role, None)
+        self.sim_context.role_counts[new_role] += 1
         self.role = new_role
 
         if recolor:
@@ -389,12 +415,12 @@ class SensorNode(wsn.Node):
 
         if len(ch_same_network) >= 2:
             # Check if they're physically separated
-            if self.id in NODE_POS:
-                my_x, my_y = NODE_POS[self.id]
+            if self.id in self.sim_context.node_positions:
+                my_x, my_y = self.sim_context.node_positions[self.id]
                 ch_positions = []
                 for ch_gui in ch_same_network:
-                    if ch_gui in NODE_POS:
-                        ch_x, ch_y = NODE_POS[ch_gui]
+                    if ch_gui in self.sim_context.node_positions:
+                        ch_x, ch_y = self.sim_context.node_positions[ch_gui]
                         ch_positions.append((ch_x, ch_y))
 
                 # If CHs are far apart, we're at boundary
@@ -584,7 +610,6 @@ class SensorNode(wsn.Node):
 
     def become_cluster_head(self, net_id, assigned_net_index=None):
         # Log Recovery Complete Logic
-        global ORPHAN_COUNT
         if self.orphan_time is not None:
             recovery_time = self.now - self.orphan_time
             self.log_role_event(
@@ -595,20 +620,16 @@ class SensorNode(wsn.Node):
                     "role": "CLUSTER_HEAD",
                 },
             )
-            ORPHAN_COUNT = max(0, ORPHAN_COUNT - 1)
-            ORPHAN_HISTORY.append((self.now, ORPHAN_COUNT))
+            self.sim_context.decrement_orphan_count(self.now)
 
             # Log Per-failure recovery
             if hasattr(self, "current_failure_id"):
-                FAILURE_EVENTS.append(
-                    {
-                        "failure_id": self.current_failure_id,
-                        "time": self.now,
-                        "node_id": self.id,
-                        "event_type": "NODE_RECOVERED",
-                        "new_role": self.role.name,
-                        "recovery_duration": recovery_time,
-                    }
+                self.sim_context.register_recovery(
+                    self.current_failure_id, 
+                    self.now, 
+                    self.id, 
+                    self.role.name, 
+                    recovery_time
                 )
                 delattr(self, "current_failure_id")
 
@@ -681,7 +702,6 @@ class SensorNode(wsn.Node):
         self, parent_addr, assigned_gui_index=None, visual_net_id=None
     ):
         # Log Recovery Complete Event
-        global ORPHAN_COUNT
         if self.orphan_time is not None:
             recovery_time = self.now - self.orphan_time
             self.log_role_event(
@@ -692,20 +712,16 @@ class SensorNode(wsn.Node):
                     "role": "REGISTERED",
                 },
             )
-            ORPHAN_COUNT = max(0, ORPHAN_COUNT - 1)
-            ORPHAN_HISTORY.append((self.now, ORPHAN_COUNT))
+            self.sim_context.decrement_orphan_count(self.now)
 
             # Log failure event
             if hasattr(self, "current_failure_id"):
-                FAILURE_EVENTS.append(
-                    {
-                        "failure_id": self.current_failure_id,
-                        "time": self.now,
-                        "node_id": self.id,
-                        "event_type": "NODE_RECOVERED",
-                        "new_role": self.role.name,
-                        "recovery_duration": recovery_time,
-                    }
+                self.sim_context.register_recovery(
+                    self.current_failure_id,
+                    self.now,
+                    self.id,
+                    self.role.name,
+                    recovery_time
                 )
                 delattr(self, "current_failure_id")
 
@@ -740,7 +756,6 @@ class SensorNode(wsn.Node):
 
     def become_router(self, parent_addr, assigned_gui_index=None, visual_net_id=None):
         # log role event recovery complete
-        global ORPHAN_COUNT
         if self.orphan_time is not None:
             recovery_time = self.now - self.orphan_time
             self.log_role_event(
@@ -751,20 +766,16 @@ class SensorNode(wsn.Node):
                     "role": "ROUTER",
                 },
             )
-            ORPHAN_COUNT = max(0, ORPHAN_COUNT - 1)
-            ORPHAN_HISTORY.append((self.now, ORPHAN_COUNT))
+            self.sim_context.decrement_orphan_count(self.now)
 
             # Log failure event
             if hasattr(self, "current_failure_id"):
-                FAILURE_EVENTS.append(
-                    {
-                        "failure_id": self.current_failure_id,
-                        "time": self.now,
-                        "node_id": self.id,
-                        "event_type": "NODE_RECOVERED",
-                        "new_role": self.role.name,
-                        "recovery_duration": recovery_time,
-                    }
+                self.sim_context.register_recovery(
+                    self.current_failure_id,
+                    self.now,
+                    self.id,
+                    self.role.name,
+                    recovery_time
                 )
                 delattr(self, "current_failure_id")
 
@@ -813,7 +824,6 @@ class SensorNode(wsn.Node):
     ###################
     def become_unregistered(self):
         """Handles becoming unregistered"""
-        global ORPHAN_COUNT
         was_cluster_head = self.role == Roles.CLUSTER_HEAD
 
         # Orphan Logic
@@ -824,8 +834,7 @@ class SensorNode(wsn.Node):
             Roles.UNDISCOVERED,
         ]:
             # UNDISCOVERED transitions to UNREGISTERED, effectively becoming an orphan of the system
-            ORPHAN_COUNT += 1
-            ORPHAN_HISTORY.append((self.now, ORPHAN_COUNT))
+            self.sim_context.increment_orphan_count(self.now)
             self.orphan_time = self.now
 
             self.log_role_event(
@@ -853,8 +862,8 @@ class SensorNode(wsn.Node):
 
                 if self.last_demotion_time is not None:
                     self.demotion_parent_gui = self.parent_gui
-                    if self.id in NODE_POS:
-                        self.demotion_location = NODE_POS[self.id]
+                    if self.id in self.sim_context.node_positions:
+                        self.demotion_location = self.sim_context.node_positions[self.id]
 
         self.scene.nodecolor(self.id, 1, 1, 0)
         self.set_label(str(self.id))
@@ -933,9 +942,9 @@ class SensorNode(wsn.Node):
         pck["last_heard"] = self.now
 
         # compute distance between self and neighbor
-        if pck["gui"] in NODE_POS and self.id in NODE_POS:
-            x1, y1 = NODE_POS[self.id]
-            x2, y2 = NODE_POS[pck["gui"]]
+        if pck["gui"] in self.sim_context.node_positions and self.id in self.sim_context.node_positions:
+            x1, y1 = self.sim_context.node_positions[self.id]
+            x2, y2 = self.sim_context.node_positions[pck["gui"]]
             pck["distance"] = math.hypot(x1 - x2, y1 - y2)
         self.neighbors_table[pck["gui"]] = pck
 
@@ -1230,9 +1239,9 @@ class SensorNode(wsn.Node):
                     if len(ch_list) >= 2:
                         distances = []
                         for ch_gui in ch_list:
-                            if ch_gui in NODE_POS and gui in NODE_POS:
-                                x1, y1 = NODE_POS[ch_gui]
-                                x2, y2 = NODE_POS[gui]
+                            if ch_gui in self.sim_context.node_positions and gui in self.sim_context.node_positions:
+                                x1, y1 = self.sim_context.node_positions[ch_gui]
+                                x2, y2 = self.sim_context.node_positions[gui]
                                 dist = math.hypot(x1 - x2, y1 - y2)
                                 distances.append(dist)
 
@@ -2182,28 +2191,30 @@ ROOT_POS_INDEX = random.randrange(config.SIM_NODE_COUNT)  # RANDOM POSITION FOR 
 
 def write_node_distances_csv(path="node_distances.csv"):
     """Write pairwise node-to-node Euclidean distances as an edge list."""
-    ids = sorted(NODE_POS.keys())
+    if SIMULATION_CONTEXT is None: return
+    ids = sorted(SIMULATION_CONTEXT.node_positions.keys())
     with open(path, "w", newline="") as f:
         w = csv.writer(f)
         w.writerow(["source_id", "target_id", "distance"])
         for i, sid in enumerate(ids):
-            x1, y1 = NODE_POS[sid]
+            x1, y1 = SIMULATION_CONTEXT.node_positions[sid]
             for tid in ids[i + 1 :]:  # i+1 to avoid duplicates and self-pairs
-                x2, y2 = NODE_POS[tid]
+                x2, y2 = SIMULATION_CONTEXT.node_positions[tid]
                 dist = math.hypot(x1 - x2, y1 - y2)
                 w.writerow([sid, tid, f"{dist:.6f}"])
 
 
 def write_node_distance_matrix_csv(path="node_distance_matrix.csv"):
-    ids = sorted(NODE_POS.keys())
+    if SIMULATION_CONTEXT is None: return
+    ids = sorted(SIMULATION_CONTEXT.node_positions.keys())
     with open(path, "w", newline="") as f:
         w = csv.writer(f)
         w.writerow(["node_id"] + ids)
         for sid in ids:
-            x1, y1 = NODE_POS[sid]
+            x1, y1 = SIMULATION_CONTEXT.node_positions[sid]
             row = [sid]
             for tid in ids:
-                x2, y2 = NODE_POS[tid]
+                x2, y2 = SIMULATION_CONTEXT.node_positions[tid]
                 dist = math.hypot(x1 - x2, y1 - y2)
                 row.append(f"{dist:.6f}")
             w.writerow(row)
@@ -2211,14 +2222,15 @@ def write_node_distance_matrix_csv(path="node_distance_matrix.csv"):
 
 def write_clusterhead_distances_csv(path="clusterhead_distances.csv"):
     """Write pairwise distances between current cluster heads."""
+    if SIMULATION_CONTEXT is None: return
     clusterheads = []
     for node in sim.nodes:
         if (
             hasattr(node, "role")
             and node.role == Roles.CLUSTER_HEAD
-            and node.id in NODE_POS
+            and node.id in SIMULATION_CONTEXT.node_positions
         ):
-            x, y = NODE_POS[node.id]
+            x, y = SIMULATION_CONTEXT.node_positions[node.id]
             clusterheads.append((node.id, x, y))
 
     with open(path, "w", newline="") as f:
@@ -2233,7 +2245,7 @@ def write_clusterhead_distances_csv(path="clusterhead_distances.csv"):
 
 def write_neighbor_distances_csv(path="neighbor_distances.csv", dedupe_undirected=True):
     """Export neighbor distances per node."""
-    if not globals().get("NODE_POS"):
+    if SIMULATION_CONTEXT is None or not SIMULATION_CONTEXT.node_positions:
         return
 
     seen_pairs = set()
@@ -2255,7 +2267,7 @@ def write_neighbor_distances_csv(path="neighbor_distances.csv", dedupe_undirecte
             if not hasattr(node, "neighbors_table"):
                 continue
 
-            x1, y1 = NODE_POS.get(node.id, (None, None))
+            x1, y1 = SIMULATION_CONTEXT.node_positions.get(node.id, (None, None))
             if x1 is None:
                 continue
 
@@ -2267,7 +2279,7 @@ def write_neighbor_distances_csv(path="neighbor_distances.csv", dedupe_undirecte
                             continue
                         seen_pairs.add(key)
 
-                    x2, y2 = NODE_POS.get(n_gui, (None, None))
+                    x2, y2 = SIMULATION_CONTEXT.node_positions.get(n_gui, (None, None))
                     if x2 is None:
                         continue
 
@@ -2410,10 +2422,11 @@ def write_recovery_metrics_csv(path="recovery_metrics.csv"):
 
 def write_orphan_metrics_csv(path="orphan_metrics.csv"):
     """Export global orphan count history."""
+    if SIMULATION_CONTEXT is None: return
     with open(path, "w", newline="") as f:
         w = csv.writer(f)
         w.writerow(["time", "orphan_count"])
-        for time, count in ORPHAN_HISTORY:
+        for time, count in SIMULATION_CONTEXT.orphan_history:
             w.writerow([f"{time:.2f}", count])
 
 
@@ -2477,11 +2490,12 @@ def write_packet_loss_csv(path="packet_loss.csv"):
 # --- Failure CSV Writers ---
 def write_failure_events_csv(path="failure_events.csv"):
     """Export node failure and recovery events."""
+    if SIMULATION_CONTEXT is None: return
     with open(path, "w", newline="") as f:
         w = csv.writer(f)
         w.writerow(["failure_id", "time", "node_id", "event_type", "role", "duration"])
 
-        for event in FAILURE_EVENTS:
+        for event in SIMULATION_CONTEXT.failure_events:
             duration = event.get("recovery_duration", "")
             if duration:
                 duration = f"{duration:.2f}"
@@ -2501,6 +2515,9 @@ def write_failure_events_csv(path="failure_events.csv"):
 ###########################################################
 def create_network(node_class, number_of_nodes=100):
     """Creates given number of nodes at random positions with random arrival times."""
+    global SIMULATION_CONTEXT
+    SIMULATION_CONTEXT = SimulationContext() # Reset context on new network
+    
     edge = math.ceil(math.sqrt(number_of_nodes))
     for i in range(number_of_nodes):
         pos_index = i
@@ -2529,55 +2546,55 @@ def create_network(node_class, number_of_nodes=100):
             )
         )
         node = sim.add_node(node_class, (px, py))
-        NODE_POS[node.id] = (px, py)
+        SIMULATION_CONTEXT.node_positions[node.id] = (px, py)
         node.tx_range = config.NODE_TX_RANGE * config.SCALE
         node.logging = True
         node.arrival = random.uniform(0, config.NODE_ARRIVAL_MAX)
         if node.id == ROOT_ID:
             node.arrival = 0.1
 
+if __name__ == "__main__":
+    sim = wsn.Simulator(
+        duration=config.SIM_DURATION,
+        timescale=config.SIM_TIME_SCALE,
+        visual=config.SIM_VISUALIZATION,
+        terrain_size=config.SIM_TERRAIN_SIZE,
+        title=config.SIM_TITLE,
+    )
 
-sim = wsn.Simulator(
-    duration=config.SIM_DURATION,
-    timescale=config.SIM_TIME_SCALE,
-    visual=config.SIM_VISUALIZATION,
-    terrain_size=config.SIM_TERRAIN_SIZE,
-    title=config.SIM_TITLE,
-)
+    # creating random network
+    create_network(SensorNode, config.SIM_NODE_COUNT)
 
-# creating random network
-create_network(SensorNode, config.SIM_NODE_COUNT)
+    # --- FAILURE INJECTION SCHEDULING ---
+    if ENABLE_FAILURES:
+        for failure_time, node_id in FAILURE_SCHEDULE:
+            # Find the node object by ID
+            target_node = next((n for n in sim.nodes if n.id == node_id), None)
+            if target_node:
+                print(f"SCHEDULING FAILURE: Node {node_id} at t={failure_time}")
+                target_node.set_timer(f"TIMER_KILL_NODE_{node_id}", failure_time)
 
-# --- FAILURE INJECTION SCHEDULING ---
-if ENABLE_FAILURES:
-    for failure_time, node_id in FAILURE_SCHEDULE:
-        # Find the node object by ID
-        target_node = next((n for n in sim.nodes if n.id == node_id), None)
-        if target_node:
-            print(f"SCHEDULING FAILURE: Node {node_id} at t={failure_time}")
-            target_node.set_timer(f"TIMER_KILL_NODE_{node_id}", failure_time)
+    write_node_distances_csv("node_distances.csv")
+    write_node_distance_matrix_csv("node_distance_matrix.csv")
 
-write_node_distances_csv("node_distances.csv")
-write_node_distance_matrix_csv("node_distance_matrix.csv")
+    # start the simulation
+    sim.run()
+    print("Simulation Finished")
 
-# start the simulation
-sim.run()
-print("Simulation Finished")
-
-# Export all metrics
-write_packet_metrics_csv("packet_metrics.csv")
-write_packet_paths_csv("packet_paths.csv")
-write_join_times_csv("join_times.csv")
-write_role_events_csv("role_events.csv")
-write_recovery_metrics_csv("recovery_metrics.csv")
-write_orphan_metrics_csv("orphan_metrics.csv")
+    # Export all metrics
+    write_packet_metrics_csv("packet_metrics.csv")
+    write_packet_paths_csv("packet_paths.csv")
+    write_join_times_csv("join_times.csv")
+    write_role_events_csv("role_events.csv")
+    write_recovery_metrics_csv("recovery_metrics.csv")
+    write_orphan_metrics_csv("orphan_metrics.csv")
 
 
-# Join Network Events
-write_cluster_events_csv("cluster_events.csv")
+    # Join Network Events
+    write_cluster_events_csv("cluster_events.csv")
 
-# packet loss metrics
-write_packet_loss_csv("packet_loss.csv")
+    # packet loss metrics
+    write_packet_loss_csv("packet_loss.csv")
 
-# failure logging
-write_failure_events_csv("failure_events.csv")
+    # failure logging
+    write_failure_events_csv("failure_events.csv")
